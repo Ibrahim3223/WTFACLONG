@@ -1,8 +1,19 @@
-# autoshorts_daily.py — Topic-locked Gemini • Per-video search_terms • Robust Pexels
+# autoshorts_daily.py — Topic-locked Gemini • Per-video search_terms • Robust Pexels 
 # Captions: ALL CAPS + karaoke (kelime highlight) — drawtext/subtitles fallback
 # -*- coding: utf-8 -*-
 import os, sys, re, json, time, random, datetime, tempfile, pathlib, subprocess, hashlib, math, shutil
 from typing import List, Optional, Tuple, Dict, Any, Set
+
+# ==== LONGFORM/ASPECT SWITCH (minimal invasive) ======================================
+# Defaults keep old shorts behavior (9:16). Set ASPECT=16:9 and LONGFORM=1 for 3–5 min.
+ASPECT_RAW = (os.getenv("ASPECT", "9:16") or "9:16").strip().lower()
+LONGFORM   = (os.getenv("LONGFORM", os.getenv("LONGFORM_ENABLE", "0")) == "1")
+if ASPECT_RAW in {"16:9", "landscape", "widescreen"}:
+    VIDEO_W, VIDEO_H = 1920, 1080
+    PEXELS_ORIENT = "landscape"
+else:
+    VIDEO_W, VIDEO_H = 1080, 1920
+    PEXELS_ORIENT = "portrait"
 
 # ---- focus-entity cooldown (stronger anti-repeat) ----
 ENTITY_COOLDOWN_DAYS = int(os.getenv("ENTITY_COOLDOWN_DAYS", os.getenv("NOVELTY_WINDOW", "30")))
@@ -140,8 +151,9 @@ def _adj_time(t_seconds: float) -> float:
 
 # ==================== ENV / constants ====================
 VOICE_STYLE    = os.getenv("TTS_STYLE", "narration-professional")
-TARGET_MIN_SEC = _env_float("TARGET_MIN_SEC", 22.0)
-TARGET_MAX_SEC = _env_float("TARGET_MAX_SEC", 42.0)
+# Not enforced, kept for compatibility with shorts
+TARGET_MIN_SEC = _env_float("TARGET_MIN_SEC", 180.0 if LONGFORM else 22.0)
+TARGET_MAX_SEC = _env_float("TARGET_MAX_SEC", 300.0 if LONGFORM else 42.0)
 
 CHANNEL_NAME   = os.getenv("CHANNEL_NAME", "DefaultChannel")
 MODE           = os.getenv("MODE", "freeform").strip().lower()
@@ -191,11 +203,11 @@ def _parse_terms(s: str) -> List[str]:
 
 SEARCH_TERMS_ENV = _parse_terms(os.getenv("SEARCH_TERMS", ""))
 
-TARGET_FPS       = 25
+TARGET_FPS       = int(os.getenv("TARGET_FPS", "25"))
 CRF_VISUAL       = 22
 
-CAPTION_MAX_LINE  = int(os.getenv("CAPTION_MAX_LINE",  "28"))
-CAPTION_MAX_LINES = int(os.getenv("CAPTION_MAX_LINES", "6"))
+CAPTION_MAX_LINE  = int(os.getenv("CAPTION_MAX_LINE",  "36" if VIDEO_W > VIDEO_H else "28"))
+CAPTION_MAX_LINES = int(os.getenv("CAPTION_MAX_LINES", "4"  if VIDEO_W > VIDEO_H else "6"))
 
 # ---------- Pexels ayarları ----------
 PEXELS_PER_PAGE            = int(os.getenv("PEXELS_PER_PAGE", "30"))
@@ -714,21 +726,24 @@ def quantize_to_frames(seconds: float, fps: int = TARGET_FPS) -> Tuple[int, floa
     return frames, frames / float(fps)
 
 def make_segment(src: str, dur_s: float, outp: str):
+    """
+    Segment now respects ASPECT and loops source to match narration.
+    """
     frames, qdur = quantize_to_frames(dur_s, TARGET_FPS)
-    fade = max(0.05, min(0.12, qdur/8.0))
+    fade = max(0.08, min(0.22, qdur/8.0))
     fade_out_st = max(0.0, qdur - fade)
     vf = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
+        f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_W}:{VIDEO_H},"
         "eq=brightness=0.02:contrast=1.08:saturation=1.1,"
         f"fps={TARGET_FPS},"
         f"setpts=N/{TARGET_FPS}/TB,"
-        f"trim=start_frame=0:end_frame={frames},"
         f"fade=t=in:st=0:d={fade:.2f},"
         f"fade=t=out:st={fade_out_st:.2f}:d={fade:.2f}"
     )
     run([
         "ffmpeg","-y","-hide_banner","-loglevel","error",
+        "-stream_loop","-1","-t", f"{qdur:.3f}",
         "-i", src,
         "-vf", vf,
         "-r", str(TARGET_FPS), "-vsync","cfr",
@@ -767,8 +782,13 @@ def _build_karaoke_ass(text: str, seg_dur: float, words: List[Tuple[str,float]],
         return f"&H00{bb}{gg}{rr}"
 
     fontname = "DejaVu Sans"
-    fontsize = 58 if is_hook else 52
-    margin_v = 270 if is_hook else 330
+    # landscape: slightly smaller font & tighter margin
+    if VIDEO_W > VIDEO_H:
+        fontsize = 44 if is_hook else 40
+        margin_v = int(VIDEO_H * (0.12 if is_hook else 0.16))
+    else:
+        fontsize = 58 if is_hook else 52
+        margin_v = int(VIDEO_H * (0.14 if is_hook else 0.17))
     outline  = 4  if is_hook else 3
 
     # Kelimeleri UPPERCASE + süreleri al
@@ -858,8 +878,8 @@ def _build_karaoke_ass(text: str, seg_dur: float, words: List[Tuple[str,float]],
 
     ass = f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: {VIDEO_W}
+PlayResY: {VIDEO_H}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
@@ -916,9 +936,15 @@ def draw_capcut_text(seg: str, text: str, color: str, font: str, outp: str, is_h
         if n_lines >= 8: fs = int(fs * 0.80)
         fs = max(22, fs)
 
-        if n_lines >= 6:   y_pos = "(h*0.55 - text_h/2)"
-        elif n_lines >= 4: y_pos = "(h*0.58 - text_h/2)"
-        else:              y_pos = "h-h/3-text_h/2"
+        if VIDEO_W > VIDEO_H:
+            # landscape placement
+            if n_lines >= 6:   y_pos = "(h*0.70 - text_h/2)"
+            elif n_lines >= 4: y_pos = "(h*0.74 - text_h/2)"
+            else:              y_pos = "(h*0.78 - text_h/2)"
+        else:
+            if n_lines >= 6:   y_pos = "(h*0.55 - text_h/2)"
+            elif n_lines >= 4: y_pos = "(h*0.58 - text_h/2)"
+            else:              y_pos = "h-h/3-text_h/2"
 
         font_arg = f":fontfile={_ff_sanitize_font(font)}" if font else ""
         col = _ff_color(color)
@@ -997,7 +1023,8 @@ def overlay_cta_tail(video_in: str, text: str, outp: str, show_sec: float, font:
     wrapped = wrap_mobile_lines(text.upper(), max_line_length=26, max_lines=3)
     pathlib.Path(tf).write_text(wrapped, encoding="utf-8")
     font_arg = f":fontfile={_ff_sanitize_font(font)}" if font else ""
-    common = f"textfile='{tf}':fontsize=52:x=(w-text_w)/2:y=h*0.18:line_spacing=10"
+    y_frac = 0.16 if VIDEO_W > VIDEO_H else 0.18
+    common = f"textfile='{tf}':fontsize=52:x=(w-text_w)/2:y=h*{y_frac}:line_spacing=10"
     box    = f"drawtext={common}{font_arg}:fontcolor=white@0.0:box=1:boxborderw=18:boxcolor=black@0.55:enable='gte(t,{t0:.3f})'"
     main   = f"drawtext={common}{font_arg}:fontcolor={_ff_color('#3EA6FF')}:borderw=5:bordercolor=black@0.9:enable='gte(t,{t0:.3f})'"
     vf     = f"{box},{main},fps={TARGET_FPS},setpts=N/{TARGET_FPS}/TB"
@@ -1078,6 +1105,25 @@ Rules:
 - Each fact must be specific & visual. 6–12 words per sentence."""
 }
 
+# Longform variants (activated when LONGFORM=1)
+LONGFORM_TEMPLATES = {
+    "_default": """Create a 3–5 minute YouTube video.
+Return STRICT JSON with keys: topic, sentences (6–10), search_terms (6–12), title, description, tags.
+Rules:
+- 'sentences' MUST be 6–10 SCENES. Each item is a SHORT PARAGRAPH (2–3 sentences, 35–60 words total).
+- Scene 1 = crisp HOOK (≤12 words opening, then 1–2 supportive lines).
+- Last scene = soft CTA for comments (no subscribe/like words).
+- Each scene advances one concrete idea with vivid, visual language. Avoid meta/filler.
+- Language = same as input; keep it natural.""",
+
+    "country_facts": """Create a 3–5 minute video of specific country/city facts.
+Return STRICT JSON with keys: topic, sentences (6–10), search_terms (6–12), title, description, tags.
+Rules:
+- 'sentences' are SCENES: 2–3 sentences each (35–60 words).
+- Start with a sharp HOOK. End with a soft CTA focused on comments.
+- Facts must be concrete and visual; avoid filler and meta-talk."""
+}
+
 BANNED_PHRASES = [
     "one clear tip", "see it", "learn it", "plot twist",
     "soap-opera narration", "repeat once", "takeaway action",
@@ -1136,7 +1182,7 @@ def _derive_terms_from_text(topic: str, sentences: List[str]) -> List[str]:
 
 def build_via_gemini(channel_name: str, topic_lock: str, user_terms: List[str], banlist: List[str]) -> Tuple[str,List[str],List[str],str,str,List[str]]:
     tpl_key = _select_template_key(topic_lock)
-    template = ENHANCED_GEMINI_TEMPLATES[tpl_key]
+    template = (LONGFORM_TEMPLATES if LONGFORM else ENHANCED_GEMINI_TEMPLATES)[tpl_key]
     avoid = "\n".join(f"- {b}" for b in banlist[:15]) if banlist else "(none)"
     terms_hint = ", ".join(user_terms[:10]) if user_terms else "(none)"
     extra = (("\nADDITIONAL STYLE:\n"+GEMINI_PROMPT) if GEMINI_PROMPT else "")
@@ -1162,7 +1208,7 @@ Avoid overlap for 180 days:
 
     topic   = topic_lock
     sentences = [clean_caption_text(s) for s in (data.get("sentences") or [])]
-    sentences = [s for s in sentences if s][:8]
+    sentences = [s for s in sentences if s][: (10 if LONGFORM else 8)]
     terms = data.get("search_terms") or []
     if isinstance(terms, str): terms=[terms]
     terms = _terms_normalize(terms)
@@ -1319,9 +1365,14 @@ def _pexels_headers():
     return {"Authorization": PEXELS_API_KEY}
 
 def _is_vertical_ok(w: int, h: int) -> bool:
-    if PEXELS_STRICT_VERTICAL:
-        return h > w and h >= PEXELS_MIN_HEIGHT
-    return (h >= PEXELS_MIN_HEIGHT) and (h >= w or PEXELS_ALLOW_LANDSCAPE)
+    # Orientation-aware acceptance
+    if VIDEO_W > VIDEO_H:  # landscape
+        min_w = int(os.getenv("PEXELS_MIN_WIDTH", "1280"))
+        return (w >= h) and (w >= min_w)
+    else:  # portrait (old behavior)
+        if PEXELS_STRICT_VERTICAL:
+            return h > w and h >= PEXELS_MIN_HEIGHT
+        return (h >= PEXELS_MIN_HEIGHT) and (h >= w or PEXELS_ALLOW_LANDSCAPE)
 
 def _pexels_search(query: str, locale: str, page: int = 1, per_page: int = None) -> List[Tuple[int, str, int, int, float]]:
     per_page = per_page or max(10, min(80, PEXELS_PER_PAGE))
@@ -1329,7 +1380,7 @@ def _pexels_search(query: str, locale: str, page: int = 1, per_page: int = None)
     r = requests.get(
         url, headers=_pexels_headers(),
         params={"query": query, "per_page": per_page, "page": page,
-                "orientation":"portrait","size":"large","locale": locale},
+                "orientation": PEXELS_ORIENT,"size":"large","locale": locale},
         timeout=30
     )
     if r.status_code != 200:
@@ -1725,7 +1776,7 @@ def main():
         if not ok and novelty_tries < NOVELTY_RETRIES:
             novelty_tries += 1
             print(f"⚠️ Similar to recent videos (try {novelty_tries}/{NOVELTY_RETRIES}) → rebuilding with bans: {avoid_terms[:8]}")
-            banlist = avoid_terms + banlist
+            banlist = [*avoid_terms, *banlist]
             continue
 
         # Focus-entity cooldown (stronger anti-repeat)
@@ -1788,7 +1839,9 @@ def main():
     print("🔎 Per-scene queries:")
     for q in per_scene_queries: print(f"   • {q}")
 
-    need_clips = max(6, min(12, int(os.getenv("SCENE_COUNT", "8"))))
+    # For longform, default to 8–10 scenes
+    default_scenes = "9" if LONGFORM else "8"
+    need_clips = max(6, min(12, int(os.getenv("SCENE_COUNT", default_scenes))))
     pool: List[Tuple[int,str]] = build_pexels_pool(
         topic=tpc,
         sentences=[m[0] for m in metas],
