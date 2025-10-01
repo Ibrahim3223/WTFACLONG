@@ -1,0 +1,211 @@
+name: Daily Shorts (single channel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment (channel) name"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  id-token: none
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Setup FFmpeg (fast + cached)
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: release
+
+      # ---------- SAFE ENV EXPORT (ÖNCE) ----------
+      - name: Export channel variables (safe)
+        shell: bash
+        env:
+          INPUT_ENV:            ${{ inputs.environment }}
+
+          VARS_TOPIC:           ${{ vars.TOPIC }}
+          VARS_LANG:            ${{ vars.LANG }}
+          VARS_MODE:            ${{ vars.MODE }}
+          VARS_VISIBILITY:      ${{ vars.VISIBILITY }}
+          VARS_ROTATION_SEED:   ${{ vars.ROTATION_SEED }}
+          VARS_SEARCH_TERMS:    ${{ vars.SEARCH_TERMS }}
+          VARS_GEMINI_PROMPT:   ${{ vars.GEMINI_PROMPT }}
+          VARS_TTS_RATE:        ${{ vars.TTS_RATE }}
+          VARS_TTS_VOICE:       ${{ vars.TTS_VOICE }}
+          VARS_BGM_URLS:        ${{ vars.BGM_URLS }}   # optional JSON list
+
+          # karaoke offset/speed (opsiyonel ince ayar)
+          KARAOKE_OFFSET_MS: "-200"
+          KARAOKE_SPEED: "1.20"
+        run: |
+          set -euo pipefail
+
+          CHANNEL_NAME="$INPUT_ENV"
+          LANG_VAL="${VARS_LANG:-}"
+          MODE_VAL="${VARS_MODE:-}"
+          VIS_VAL="${VARS_VISIBILITY:-}"
+          SEED_VAL="${VARS_ROTATION_SEED:-}"
+
+          wenv () {
+            local __name="$1"; shift
+            local __val="$*"
+            local __delim="EOF_${__name}_$$"
+            {
+              echo "${__name}<<${__delim}"
+              printf '%s\n' "${__val}"
+              echo "${__delim}"
+            } >> "$GITHUB_ENV"
+          }
+
+          wenv CHANNEL_NAME        "${CHANNEL_NAME}"
+          wenv TOPIC               "${VARS_TOPIC}"
+          wenv LANG                "${LANG_VAL}"
+          wenv MODE                "${MODE_VAL}"
+          wenv VISIBILITY          "${VIS_VAL:-public}"
+          wenv ROTATION_SEED       "${SEED_VAL}"
+          wenv SEARCH_TERMS        "${VARS_SEARCH_TERMS}"
+          wenv GEMINI_PROMPT       "${VARS_GEMINI_PROMPT}"
+          wenv TTS_RATE            "${VARS_TTS_RATE}"
+          wenv TTS_VOICE           "${VARS_TTS_VOICE}"
+          wenv BGM_URLS            "${VARS_BGM_URLS}"
+          wenv UPLOAD_TO_YT        "1"
+
+      # ---------- STATE caches ----------
+      - name: Restore global state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            state_global.json
+            state_global_topics.json
+          key: global-state-${{ github.run_id }}
+          restore-keys: |
+            global-state-
+
+      - name: Restore channel state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: state_${{ inputs.environment }}.json
+          key: chstate-${{ inputs.environment }}-${{ github.run_id }}
+          restore-keys: |
+            chstate-${{ inputs.environment }}-
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Build video
+        env:
+          GEMINI_API_KEY:   ${{ secrets.GEMINI_API_KEY }}
+          PEXELS_API_KEY:   ${{ secrets.PEXELS_API_KEY }}
+          YT_CLIENT_ID:     ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+
+          # captions / karaoke
+          REQUIRE_CAPTIONS: "1"
+          KARAOKE_CAPTIONS: "1"
+          CAPTIONS_UPPER:   "1"
+          KARAOKE_INACTIVE: "#FFD700"
+          KARAOKE_ACTIVE:   "#3EA6FF"
+          KARAOKE_OUTLINE:  "#000000"
+          # ==== KARAOKE SYNC TUNE ====
+          KARAOKE_SPEEDUP_PCT: "5.0"
+          KARAOKE_RAMP_PCT:    "2.0"
+          KARAOKE_EARLY_END_MS: "120"
+          CAPTION_LEAD_MS:     "80"
+
+          # novelty & cooldown
+          NOVELTY_ENFORCE: "1"
+          NOVELTY_WINDOW: "40"
+          NOVELTY_JACCARD_MAX: "0.55"
+          NOVELTY_RETRIES: "4"
+          ENTITY_COOLDOWN_DAYS: "30"
+
+          # ==== Contextual CTA ====
+          CTA_ENABLE: "1"
+          CTA_SHOW_SEC: "2.8"    # son kaç saniye görünsün
+          CTA_MAX_CHARS: "64"
+          # CTA_TEXT: ""         # boş değilse bu metni aynen kullanır (override)
+
+          # ==== BGM (arkaplan müzik) ====
+          BGM_ENABLE: "1"
+          BGM_DIR: "bgm"
+          # loop loudness / fade (loop oluştururken)
+          BGM_DB: "0"
+          BGM_FADE: "0.8"
+          # sidechain ducking (autoshorts_daily.py ile uyumlu)
+          BGM_GAIN_DB: "-11"
+          BGM_DUCK_THRESH: "0.035"
+          BGM_DUCK_RATIO: "10"
+          BGM_DUCK_ATTACK_MS: "6"
+          BGM_DUCK_RELEASE_MS: "180"
+        run: |
+          set -e
+          echo "== ${CHANNEL_NAME} =="
+          echo "TOPIC=${TOPIC}"
+          echo "LANG=${LANG}"
+          echo "SEARCH_TERMS=${SEARCH_TERMS}"
+          python autoshorts_daily.py 2>&1 | tee "build_${CHANNEL_NAME}.log"
+
+      - name: Upload artifact (mp4)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.environment }}-short
+          path: |
+            out/**/*.mp4
+            out/*.mp4
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload logs & meta
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.environment }}-logs
+          path: |
+            build_${{ env.CHANNEL_NAME }}.log
+            out/**/*.json
+            out/*.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Save global state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            state_global.json
+            state_global_topics.json
+          key: global-state-${{ github.run_id }}
+
+      - name: Save channel state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state_${{ inputs.environment }}.json
+          key: chstate-${{ inputs.environment }}-${{ github.run_id }}
