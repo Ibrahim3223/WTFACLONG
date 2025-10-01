@@ -1,4 +1,4 @@
-# autoshorts_daily.py — Topic-locked Gemini • Per-video search_terms • Robust Pexels  
+# autoshorts_daily.py — Topic-locked Gemini • Per-video search_terms • Robust Pexels
 # Captions: ALL CAPS + karaoke (kelime highlight) — drawtext/subtitles fallback
 # -*- coding: utf-8 -*-
 import os, sys, re, json, time, random, datetime, tempfile, pathlib, subprocess, hashlib, math, shutil
@@ -163,6 +163,13 @@ VISIBILITY     = _sanitize_privacy(os.getenv("VISIBILITY"))
 ROTATION_SEED  = _env_int("ROTATION_SEED", 0)
 REQUIRE_CAPTIONS = os.getenv("REQUIRE_CAPTIONS", "0") == "1"
 KARAOKE_CAPTIONS = os.getenv("KARAOKE_CAPTIONS", "1") == "1"
+
+# ---- captions master switch (LONGFORM'da varsayılan KAPALI) ----
+CAPTIONS_ENABLE   = (os.getenv("CAPTIONS_ENABLE", "0" if LONGFORM else "1") == "1")
+
+# ---- chunked montage ayarları ----
+VISUAL_CHUNK_SEC      = _env_float("VISUAL_CHUNK_SEC", 5.0)  # ekrandaki görüntü değişim aralığı (sn)
+MAX_REUSE_PER_VIDEO   = _env_int("MAX_REUSE_PER_VIDEO", 3)   # aynı Pexels klibi bir videoda en fazla kaç kez
 
 # Karaoke renkleri (ASS stili)
 KARAOKE_ACTIVE   = os.getenv("KARAOKE_ACTIVE",   "#3EA6FF")
@@ -1749,7 +1756,8 @@ def _duck_and_mix(voice_in: str, bgm_in: str, outp: str):
 # ==================== Main ====================
 def main():
     print(f"==> {CHANNEL_NAME} | MODE={MODE} | topic-first build")
-    if not (_HAS_DRAWTEXT or _HAS_SUBTITLES):
+    # Captions tamamen kapatılabildiği için, filtre yoksa sadece captions AÇIKSA uyar/engelle
+    if CAPTIONS_ENABLE and not (_HAS_DRAWTEXT or _HAS_SUBTITLES):
         msg = "⚠️ UYARI: ffmpeg'te ne 'drawtext' ne 'subtitles' var. Altyazılar üretilemez."
         if REQUIRE_CAPTIONS: raise RuntimeError(msg + " REQUIRE_CAPTIONS=1 olduğu için durduruldu.")
         else: print(msg + " (devam edilecek)")
@@ -1854,14 +1862,23 @@ def main():
         wavs.append(w); metas.append((base, d, words))
         print(f"   {i+1}/{len(sentences)}: {d:.2f}s")
 
+    # Toplam anlatım süresi ve 5 sn'lik görüntü chunk sayısı
+    total_narr = sum(d for _, d, _ in metas)
+    n_chunks = max(1, int(math.ceil(total_narr / max(0.5, VISUAL_CHUNK_SEC))))
+    print(f"🎚️ Narration total = {total_narr:.2f}s | visual chunks = {n_chunks} × {VISUAL_CHUNK_SEC:.2f}s")
+
     # 3) Pexels — per-video terms
     per_scene_queries = build_per_scene_queries([m[0] for m in metas], (search_terms or user_terms or []), topic=tpc)
     print("🔎 Per-scene queries:")
     for q in per_scene_queries: print(f"   • {q}")
 
-    # For longform, default to 8–10 scenes
+    # For longform, default to 8–10 scenes (legacy), ancak chunk montaj için
+    # en az ceil(n_chunks / MAX_REUSE_PER_VIDEO) adet benzersiz klip gerekli.
     default_scenes = "9" if LONGFORM else "8"
-    need_clips = max(6, min(12, int(os.getenv("SCENE_COUNT", default_scenes))))
+    need_clips_legacy = max(6, min(12, int(os.getenv("SCENE_COUNT", default_scenes))))
+    min_unique_needed = max(2, math.ceil(n_chunks / max(1, MAX_REUSE_PER_VIDEO)))
+    need_clips = max(need_clips_legacy, min_unique_needed)
+
     pool: List[Tuple[int,str]] = build_pexels_pool(
         topic=tpc,
         sentences=[m[0] for m in metas],
@@ -1871,7 +1888,7 @@ def main():
     )
     if not pool: raise RuntimeError("Pexels: no suitable clips (after all fallbacks).")
 
-    # 4) İndir ve dağıt
+    # 4) İndir ve havuzu oluştur
     downloads: Dict[int,str] = {}
     print("⬇️ Download pool…")
     for idx, (vid, link) in enumerate(pool):
@@ -1888,93 +1905,96 @@ def main():
     if not downloads: raise RuntimeError("Pexels pool empty after downloads.")
     print(f"   Downloaded unique clips: {len(downloads)}")
 
-    # Yeterli benzersiz klip yoksa otomatik doldur
-    if not PEXELS_ALLOW_REUSE and len(downloads) < len(metas):
-        print(f"   Not enough uniques ({len(downloads)}/{len(metas)}). Backfilling from popular…")
+    # Chunk montaj için toplam kapasite = benzersiz_klip_sayısı * MAX_REUSE_PER_VIDEO
+    capacity = len(downloads) * MAX_REUSE_PER_VIDEO
+    if capacity < n_chunks:
+        print(f"   Capacity short ({capacity} < {n_chunks}), trying to backfill more clips…")
         locale = "tr-TR" if LANG.startswith("tr") else "en-US"
-        need_more = len(metas) - len(downloads)
         page = 1
         tried = set(downloads.keys())
-        while need_more > 0 and page <= 4:
+        while capacity < n_chunks and page <= 4:
             pops = _pexels_popular(locale, page=page, per_page=50)
             page += 1
             for vid, link, w,h,dur in pops:
                 if vid in tried: continue
                 try:
-                    f = str(pathlib.Path(tmp) / f"pop_{vid}.mp4")
-                    with requests.get(link, stream=True, timeout=120) as rr:
-                        rr.raise_for_status()
-                        with open(f, "wb") as wfd:
-                            for ch in rr.iter_content(8192): wfd.write(ch)
-                    if pathlib.Path(f).stat().st_size > 300_000:
-                        downloads[vid] = f; tried.add(vid); need_more -= 1
-                        if need_more <= 0: break
-                except Exception:
-                    continue
-        # Pixabay fallback
-        if need_more > 0:
-            pix = _pixabay_fallback("interior lighting", need_more, locale)
-            for vid, link in pix:
-                try:
-                    f = str(pathlib.Path(tmp) / f"pix_{vid}.mp4")
+                    f = str(pathlib.Path(tmp) / f"capfill_{vid}.mp4")
                     with requests.get(link, stream=True, timeout=120) as rr:
                         rr.raise_for_status()
                         with open(f, "wb") as wfd:
                             for ch in rr.iter_content(8192): wfd.write(ch)
                     if pathlib.Path(f).stat().st_size > 300_000:
                         downloads[vid] = f
-                        need_more -= 1
-                        if need_more <= 0: break
+                        tried.add(vid)
+                        capacity = len(downloads) * MAX_REUSE_PER_VIDEO
+                        if capacity >= n_chunks:
+                            break
+                except Exception:
+                    continue
+        if capacity < n_chunks:
+            # Pixabay son çare
+            need_more = math.ceil((n_chunks - capacity) / max(1, MAX_REUSE_PER_VIDEO))
+            pix = _pixabay_fallback("b-roll", need_more, locale)
+            for vid, link in pix:
+                try:
+                    f = str(pathlib.Path(tmp) / f"capfill_pix_{vid}.mp4")
+                    with requests.get(link, stream=True, timeout=120) as rr:
+                        rr.raise_for_status()
+                        with open(f, "wb") as wfd:
+                            for ch in rr.iter_content(8192): wfd.write(ch)
+                    if pathlib.Path(f).stat().st_size > 300_000:
+                        downloads[vid] = f
+                        capacity = len(downloads) * MAX_REUSE_PER_VIDEO
+                        if capacity >= n_chunks:
+                            break
                 except Exception:
                     pass
-        print(f"   After backfill uniques: {len(downloads)}")
+        print(f"   Capacity after backfill: {capacity} (needed {n_chunks})")
 
-    usage = {vid:0 for vid in downloads.keys()}
-    chosen_files: List[str] = []; chosen_ids: List[int] = []
-    if not PEXELS_ALLOW_REUSE:
-        ordered = list(downloads.items())[:len(metas)]
-        if len(ordered) < len(metas):
-            print("⚠️ Still short on unique clips; enabling minimal reuse for remaining.")
-        for i in range(len(metas)):
-            if i < len(ordered):
-                vid, pathv = ordered[i]
-            else:
-                vid = min(usage.keys(), key=lambda k: usage[k]); pathv = downloads[vid]
-            usage[vid] += 1
-            chosen_files.append(pathv); chosen_ids.append(vid); _USED_PEXELS_IDS_RUNTIME.add(vid)
-    else:
-        for i in range(len(metas)):
-            picked_vid = None
-            for vid in list(usage.keys()):
-                if usage[vid] < PEXELS_MAX_USES_PER_CLIP:
-                    picked_vid = vid; break
-            if picked_vid is None:
-                picked_vid = min(usage.keys(), key=lambda k: usage[k])
-            usage[picked_vid] += 1
-            chosen_files.append(downloads[picked_vid]); chosen_ids.append(picked_vid); _USED_PEXELS_IDS_RUNTIME.add(picked_vid)
-
-    # 5) Segment + altyazı (KARAOKE)
-    print("🎬 Segments…")
+    # 5) Chunk bazlı görüntü montajı (altyazı yok)
+    print("🎬 Visual montage (fixed chunks, no captions)…")
+    vid_ids = list(downloads.keys())
+    random.shuffle(vid_ids)
+    usage = {vid: 0 for vid in vid_ids}
+    last_vid = None
     segs = []
-    for i, ((base_text, d, words), src) in enumerate(zip(metas, chosen_files)):
-        base   = str(pathlib.Path(tmp) / f"seg_{i:02d}.mp4")
-        make_segment(src, d, base)
-        colored = str(pathlib.Path(tmp) / f"segsub_{i:02d}.mp4")
-        draw_capcut_text(
-            base,
-            base_text,
-            CAPTION_COLORS[i % len(CAPTION_COLORS)],
-            font,
-            colored,
-            is_hook=(i == 0),
-            words=words
-        )
-        segs.append(colored)
+    used_ids_order: List[int] = []
 
-    # 6) Birleştir
+    def _pick_next_vid():
+        # Önce: last_vid olmayan ve kullanım < MAX olanlar
+        cands = [v for v in vid_ids if usage[v] < MAX_REUSE_PER_VIDEO and v != last_vid]
+        if not cands:
+            # Zorunlu durumda (çok az klip): last_vid hariç kapasite yoksa, last_vid'i da al.
+            cands = [v for v in vid_ids if usage[v] < MAX_REUSE_PER_VIDEO]
+        if not cands:
+            return None
+        # En az kullanılanı tercih et, eşitlikte rastgele
+        minuse = min(usage[v] for v in cands)
+        cands2 = [v for v in cands if usage[v] == minuse]
+        return random.choice(cands2)
+
+    for i in range(n_chunks):
+        pick = _pick_next_vid()
+        if pick is None:
+            print(f"⚠️ Not enough clip capacity to fill all chunks ({i}/{n_chunks}).")
+            break
+        src = downloads[pick]
+        out_seg = str(pathlib.Path(tmp) / f"chunk_{i:03d}.mp4")
+        make_segment(src, float(VISUAL_CHUNK_SEC), out_seg)
+        segs.append(out_seg)
+        used_ids_order.append(pick)
+        usage[pick] += 1
+        last_vid = pick
+
+    if len(segs) < 1:
+        raise RuntimeError("No visual chunks were created.")
+
+    # 6) Birleştir (video önce, ses sonra)
     print("🎞️ Assemble…")
-    vcat = str(pathlib.Path(tmp) / "video_concat.mp4"); concat_videos_filter(segs, vcat)
-    acat = str(pathlib.Path(tmp) / "audio_concat.wav"); concat_audios(wavs, acat)
+    vcat = str(pathlib.Path(tmp) / "video_concat.mp4")
+    concat_videos_filter(segs, vcat)
+    acat = str(pathlib.Path(tmp) / "audio_concat.wav")
+    concat_audios(wavs, acat)
 
     # 7) Süre & kare kilitleme
     adur = ffprobe_dur(acat); vdur = ffprobe_dur(vcat)
@@ -2044,7 +2064,7 @@ def main():
 
     # 11) Kullanılmış Pexels ID'leri state'e ekle
     try:
-        _blocklist_add_pexels(chosen_ids, days=30)
+        _blocklist_add_pexels(list(set(used_ids_order)), days=30)
     except Exception as e:
         print(f"⚠️ Blocklist save warn: {e}")
 
