@@ -42,6 +42,7 @@ jobs:
 
       # ---------- SAFE ENV EXPORT (unchanged) ----------
       - name: Export channel variables (safe)
+        id: prep
         shell: bash
         env:
           INPUT_ENV:            ${{ inputs.environment }}
@@ -64,6 +65,9 @@ jobs:
           set -euo pipefail
 
           CHANNEL_NAME="$INPUT_ENV"
+          CHANNEL_SAFE="$(echo "$CHANNEL_NAME" | sed -E 's/[^A-Za-z0-9]+/_/g')"
+          STATE_FILE="state_${CHANNEL_SAFE}.json"
+
           LANG_VAL="${VARS_LANG:-}"
           MODE_VAL="${VARS_MODE:-}"
           VIS_VAL="${VARS_VISIBILITY:-}"
@@ -81,6 +85,7 @@ jobs:
           }
 
           wenv CHANNEL_NAME        "${CHANNEL_NAME}"
+          wenv CHANNEL_NAME_SAFE   "${CHANNEL_SAFE}"
           wenv TOPIC               "${VARS_TOPIC}"
           wenv LANG                "${LANG_VAL}"
           wenv MODE                "${MODE_VAL}"
@@ -92,6 +97,9 @@ jobs:
           wenv TTS_VOICE           "${VARS_TTS_VOICE}"
           wenv BGM_URLS            "${VARS_BGM_URLS}"
           wenv UPLOAD_TO_YT        "1"
+
+          # cache adımlarında kullanmak için output
+          echo "state_file=${STATE_FILE}" >> "$GITHUB_OUTPUT"
 
       # ---------- STATE caches ----------
       - name: Restore global state cache
@@ -107,10 +115,10 @@ jobs:
       - name: Restore channel state cache
         uses: actions/cache/restore@v4
         with:
-          path: state_${{ inputs.environment }}.json
-          key: chstate-${{ inputs.environment }}-${{ github.run_id }}
+          path: ${{ steps.prep.outputs.state_file }}
+          key: chstate-${{ steps.prep.outputs.state_file }}-${{ github.run_id }}
           restore-keys: |
-            chstate-${{ inputs.environment }}-
+            chstate-${{ steps.prep.outputs.state_file }}-
 
       - name: Install deps
         run: |
@@ -211,5 +219,5 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: state_${{ inputs.environment }}.json
-          key: chstate-${{ inputs.environment }}-${{ github.run_id }}
+          path: ${{ steps.prep.outputs.state_file }}
+          key: chstate-${{ steps.prep.outputs.state_file }}-${{ github.run_id }}
