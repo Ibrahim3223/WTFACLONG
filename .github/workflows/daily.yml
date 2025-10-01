@@ -1,4 +1,4 @@
-name: Daily Shorts (single channel)
+name: Daily Longform (single channel)
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ concurrency:
 jobs:
   build-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     environment: ${{ inputs.environment }}
 
     steps:
@@ -40,7 +40,7 @@ jobs:
         with:
           ffmpeg-version: release
 
-      # ---------- SAFE ENV EXPORT (ÖNCE) ----------
+      # ---------- SAFE ENV EXPORT (unchanged) ----------
       - name: Export channel variables (safe)
         shell: bash
         env:
@@ -57,9 +57,9 @@ jobs:
           VARS_TTS_VOICE:       ${{ vars.TTS_VOICE }}
           VARS_BGM_URLS:        ${{ vars.BGM_URLS }}   # optional JSON list
 
-          # karaoke offset/speed (opsiyonel ince ayar)
+          # karaoke offset/speed (optional)
           KARAOKE_OFFSET_MS: "-200"
-          KARAOKE_SPEED: "1.20"
+          KARAOKE_SPEED: "1.10"
         run: |
           set -euo pipefail
 
@@ -117,7 +117,7 @@ jobs:
           python -m pip install -U pip
           pip install -r requirements.txt
 
-      - name: Build video
+      - name: Build video (LONGFORM 3–5 min)
         env:
           GEMINI_API_KEY:   ${{ secrets.GEMINI_API_KEY }}
           PEXELS_API_KEY:   ${{ secrets.PEXELS_API_KEY }}
@@ -125,18 +125,25 @@ jobs:
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
 
-          # captions / karaoke
+          # ---- Longform toggles ----
+          LONGFORM: "1"
+          ASPECT: "16:9"
+          TARGET_FPS: "30"
+          SCENE_COUNT: "9"             # 6–10 scenes recommended
+
+          # captions / karaoke (kept on; works in 16:9)
           REQUIRE_CAPTIONS: "1"
           KARAOKE_CAPTIONS: "1"
           CAPTIONS_UPPER:   "1"
           KARAOKE_INACTIVE: "#FFD700"
           KARAOKE_ACTIVE:   "#3EA6FF"
           KARAOKE_OUTLINE:  "#000000"
-          # ==== KARAOKE SYNC TUNE ====
-          KARAOKE_SPEEDUP_PCT: "5.0"
-          KARAOKE_RAMP_PCT:    "2.0"
-          KARAOKE_EARLY_END_MS: "120"
+          KARAOKE_SPEEDUP_PCT: "3.0"
+          KARAOKE_RAMP_PCT:    "1.5"
+          KARAOKE_EARLY_END_MS: "100"
           CAPTION_LEAD_MS:     "80"
+          CAPTION_MAX_LINE:    "36"
+          CAPTION_MAX_LINES:   "4"
 
           # novelty & cooldown
           NOVELTY_ENFORCE: "1"
@@ -147,17 +154,14 @@ jobs:
 
           # ==== Contextual CTA ====
           CTA_ENABLE: "1"
-          CTA_SHOW_SEC: "2.8"    # son kaç saniye görünsün
+          CTA_SHOW_SEC: "3.2"
           CTA_MAX_CHARS: "64"
-          # CTA_TEXT: ""         # boş değilse bu metni aynen kullanır (override)
 
-          # ==== BGM (arkaplan müzik) ====
+          # ==== BGM (background music) ====
           BGM_ENABLE: "1"
           BGM_DIR: "bgm"
-          # loop loudness / fade (loop oluştururken)
           BGM_DB: "0"
           BGM_FADE: "0.8"
-          # sidechain ducking (autoshorts_daily.py ile uyumlu)
           BGM_GAIN_DB: "-11"
           BGM_DUCK_THRESH: "0.035"
           BGM_DUCK_RATIO: "10"
@@ -175,7 +179,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.environment }}-short
+          name: ${{ inputs.environment }}-longform
           path: |
             out/**/*.mp4
             out/*.mp4
