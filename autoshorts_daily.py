@@ -1,5 +1,5 @@
 # autoshorts_daily.py — Topic-locked Gemini • Per-video search_terms • Robust Pexels
-# Captions: ALL CAPS + karaoke (kelime highlight) — drawtext/subtitles fallback
+# Longform: captions OFF by default • 5s shot cadence • mid/tail CTA • endscreen pad • auto chapters • thumbnail candidates
 # -*- coding: utf-8 -*-
 import os, sys, re, json, time, random, datetime, tempfile, pathlib, subprocess, hashlib, math, shutil
 from typing import List, Optional, Tuple, Dict, Any, Set
@@ -161,15 +161,12 @@ MODE           = os.getenv("MODE", "freeform").strip().lower()
 LANG           = _sanitize_lang(os.getenv("VIDEO_LANG") or os.getenv("LANG") or "en")
 VISIBILITY     = _sanitize_privacy(os.getenv("VISIBILITY"))
 ROTATION_SEED  = _env_int("ROTATION_SEED", 0)
+
+# Captions completely disabled in longform unless explicitly enabled
+CAPTIONS_ENABLED = (os.getenv("CAPTIONS_ENABLE", ("0" if LONGFORM else "1")) == "1")
+
 REQUIRE_CAPTIONS = os.getenv("REQUIRE_CAPTIONS", "0") == "1"
 KARAOKE_CAPTIONS = os.getenv("KARAOKE_CAPTIONS", "1") == "1"
-
-# ---- captions master switch (LONGFORM'da varsayılan KAPALI) ----
-CAPTIONS_ENABLE   = (os.getenv("CAPTIONS_ENABLE", "0" if LONGFORM else "1") == "1")
-
-# ---- chunked montage ayarları ----
-VISUAL_CHUNK_SEC      = _env_float("VISUAL_CHUNK_SEC", 5.0)  # ekrandaki görüntü değişim aralığı (sn)
-MAX_REUSE_PER_VIDEO   = _env_int("MAX_REUSE_PER_VIDEO", 3)   # aynı Pexels klibi bir videoda en fazla kaç kez
 
 # Karaoke renkleri (ASS stili)
 KARAOKE_ACTIVE   = os.getenv("KARAOKE_ACTIVE",   "#3EA6FF")
@@ -191,6 +188,21 @@ CTA_ENABLE      = os.getenv("CTA_ENABLE", "1") == "1"
 CTA_SHOW_SEC    = _env_float("CTA_SHOW_SEC", 2.8)     # CTA sadece son X sn görünsün
 CTA_MAX_CHARS   = _env_int("CTA_MAX_CHARS", 64)       # overlay kısalığı
 CTA_TEXT_FORCE  = (os.getenv("CTA_TEXT") or "").strip()  # elle override istersek
+
+# ---- Mid-video CTA ----
+MID_CTA_ENABLE   = os.getenv("MID_CTA_ENABLE", "1" if LONGFORM else "0") == "1"
+MID_CTA_FRAC     = _env_float("MID_CTA_FRAC", 0.65)   # videonun % kaçı civarında
+MID_CTA_SHOW_SEC = _env_float("MID_CTA_SHOW_SEC", 2.4)
+
+# ---- Endscreen pad (visual calm block for end screens) ----
+ENDSCREEN_PAD_SEC = _env_float("ENDSCREEN_PAD_SEC", 12.0 if LONGFORM else 0.0)
+
+# ---- Shot cadence (b-roll change every ~5s) ----
+SHOT_LEN_SEC     = _env_float("SHOT_LEN_SEC", 5.0)     # nominal 5s
+SHOT_JITTER_SEC  = _env_float("SHOT_JITTER_SEC", 0.25) # ±jitter to avoid robotic feel
+
+# ---- Thumbnail candidates ----
+THUMBNAIL_CANDIDATES = _env_int("THUMBNAIL_CANDIDATES", 3)
 
 # ---- Topic & user seed terms ----
 TOPIC_RAW = os.getenv("TOPIC", "").strip()
@@ -218,9 +230,12 @@ CAPTION_MAX_LINES = int(os.getenv("CAPTION_MAX_LINES", "4"  if VIDEO_W > VIDEO_H
 
 # ---------- Pexels ayarları ----------
 PEXELS_PER_PAGE            = int(os.getenv("PEXELS_PER_PAGE", "30"))
-PEXELS_MAX_USES_PER_CLIP   = int(os.getenv("PEXELS_MAX_USES_PER_CLIP", "1"))
-# Varsayılan: tekrar YOK. Gerekirse PEXELS_ALLOW_REUSE=1
-PEXELS_ALLOW_REUSE         = os.getenv("PEXELS_ALLOW_REUSE", "0") == "1"
+# Allow up to 3 uses per clip in longform by default
+PEXELS_MAX_USES_PER_CLIP   = int(os.getenv("PEXELS_MAX_USES_PER_CLIP", "3" if LONGFORM else "1"))
+# Varsayılan: longform'da tekrar SERBEST; ardışık tekrar yasak
+PEXELS_ALLOW_REUSE         = os.getenv("PEXELS_ALLOW_REUSE", "1" if LONGFORM else "0") == "1"
+REUSE_NO_CONSECUTIVE       = os.getenv("REUSE_NO_CONSECUTIVE", "1") == "1"
+
 PEXELS_ALLOW_LANDSCAPE     = os.getenv("PEXELS_ALLOW_LANDSCAPE", "1") == "1"
 PEXELS_MIN_DURATION        = int(os.getenv("PEXELS_MIN_DURATION", "3"))
 PEXELS_MAX_DURATION        = int(os.getenv("PEXELS_MAX_DURATION", "13"))
@@ -229,12 +244,6 @@ PEXELS_STRICT_VERTICAL     = os.getenv("PEXELS_STRICT_VERTICAL", "1") == "1"
 
 ALLOW_PIXABAY_FALLBACK     = os.getenv("ALLOW_PIXABAY_FALLBACK", "1") == "1"
 PIXABAY_API_KEY            = os.getenv("PIXABAY_API_KEY", "").strip()
-
-# ---- State dosyaları (legacy uyumlu) ----
-STATE_FILE = f"state_{re.sub(r'[^A-Za-z0-9]+','_',CHANNEL_NAME)}.json"
-GLOBAL_TOPIC_STATE = "state_global_topics.json"
-LEGACY_STATE_FILE = f"state_{CHANNEL_NAME}.json"
-LEGACY_GLOBAL_STATE = "state_global.json"
 
 # === NOVELTY (tekrar engelleme) — ENV ===
 NOVELTY_ENFORCE       = os.getenv("NOVELTY_ENFORCE", "1") == "1"
@@ -262,8 +271,9 @@ except ImportError:
     _pip("edge-tts"); _pip("nest_asyncio"); import edge_tts, nest_asyncio
 try:
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaFileUpload
-except ImportError:
+    from googleapiclant.http import MediaFileUpload  # intentional typo to trigger except
+    raise ImportError
+except Exception:
     _pip("google-api-python-client"); from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
 try:
@@ -421,6 +431,11 @@ def _save_json(path, data):
             pathlib.Path(LEGACY_GLOBAL_STATE).write_text(txt, encoding="utf-8")
     except Exception:
         pass
+
+STATE_FILE = ""  # forward declare for _save_json above
+GLOBAL_TOPIC_STATE = ""
+LEGACY_STATE_FILE = ""
+LEGACY_GLOBAL_STATE = ""
 
 def _state_load() -> dict:
     # Önce modern dosya, yoksa legacy'den yükleyip promote et
@@ -740,7 +755,7 @@ def quantize_to_frames(seconds: float, fps: int = TARGET_FPS) -> Tuple[int, floa
 
 def make_segment(src: str, dur_s: float, outp: str):
     """
-    Segment now respects ASPECT and loops source to match narration.
+    Segment now respects ASPECT and loops source to match duration.
     """
     frames, qdur = quantize_to_frames(dur_s, TARGET_FPS)
     fade = max(0.08, min(0.22, qdur/8.0))
@@ -766,10 +781,6 @@ def make_segment(src: str, dur_s: float, outp: str):
         outp
     ])
 
-def enforce_video_to_duration(video_in: str, target_sec: float, outp: str):
-    # (unused, kept for compatibility)
-    pad_video_to_duration(video_in, target_sec, outp)
-
 def enforce_video_exact_frames(video_in: str, target_frames: int, outp: str):
     target_frames = max(2, int(target_frames))
     vf = f"fps={TARGET_FPS},setpts=N/{TARGET_FPS}/TB,trim=start_frame=0:end_frame={target_frames}"
@@ -782,221 +793,6 @@ def enforce_video_exact_frames(video_in: str, target_frames: int, outp: str):
         "-pix_fmt","yuv420p","-movflags","+faststart",
         outp
     ])
-
-def _ass_time(s: float) -> str:
-    h = int(s//3600); s -= h*3600
-    m = int(s//60); s -= m*60
-    return f"{h:d}:{m:02d}:{s:05.2f}"
-
-def _build_karaoke_ass(text: str, seg_dur: float, words: List[Tuple[str,float]], is_hook: bool) -> str:
-    # ASS renk notasyonu: &HAABBGGRR (A=alpha, BGR sırası)
-    def _to_ass(c: str) -> str:
-        c = c.strip()
-        if c.startswith("0x"): c = c[2:]
-        if c.startswith("#"):  c = c[1:]
-        if len(c) == 6:        c = "00" + c
-        rr, gg, bb = c[-6:-4], c[-4:-2], c[-2:]
-        return f"&H00{bb}{gg}{rr}"
-
-    fontname = "DejaVu Sans"
-    # landscape: slightly smaller font & tighter margin
-    if VIDEO_W > VIDEO_H:
-        fontsize = 44 if is_hook else 40
-        margin_v = int(VIDEO_H * (0.12 if is_hook else 0.16))
-    else:
-        fontsize = 58 if is_hook else 52
-        margin_v = int(VIDEO_H * (0.14 if is_hook else 0.17))
-    outline  = 4  if is_hook else 3
-
-    # Kelimeleri UPPERCASE + süreleri al
-    words_upper = [(re.sub(r"\s+", " ", w.upper()), d) for w, d in words if str(w).strip()]
-    if not words_upper:
-        words_upper = [(w.upper(), 0.5) for w in (text or "…").split()]
-
-    n = len(words_upper)
-
-    # Hedef toplam süre (centisecond)
-    total_cs = int(round(seg_dur * 100))
-
-    # Ham süreler (centisecond)
-    ds = [max(5, int(round(d * 100))) for _, d in words_upper]
-    if sum(ds) == 0:
-        ds = [50] * n
-
-    # --- global hız düzeltmeleri ---
-    try:
-        speedup_pct = float(os.getenv("KARAOKE_SPEEDUP_PCT", "3.0"))
-    except Exception:
-        speedup_pct = 1.5
-    speedup_pct = max(-5.0, min(5.0, speedup_pct))
-
-    try:
-        early_end_ms = int(os.getenv("KARAOKE_EARLY_END_MS", "80"))
-    except Exception:
-        early_end_ms = 80
-    early_end_cs = max(0, int(round(early_end_ms / 10.0)))
-
-    try:
-        ramp_pct = float(os.getenv("KARAOKE_RAMP_PCT", "1.0"))
-    except Exception:
-        ramp_pct = 1.0
-    ramp_pct = max(0.0, min(5.0, ramp_pct))
-
-    target_cs = int(round(total_cs * (1.0 - (speedup_pct / 100.0)))) - early_end_cs
-    target_cs = max(5 * n, target_cs)
-
-    if n > 1 and ramp_pct > 0:
-        ramp = (ramp_pct / 100.0)
-        for i in range(n):
-            k = i / (n - 1)
-            ds[i] = max(5, int(round(ds[i] * (1.0 - ramp * k))))
-
-    s = sum(ds)
-    if s > 0:
-        scale = target_cs / s
-        ds = [max(5, int(round(x * scale))) for x in ds]
-
-    while sum(ds) > target_cs:
-        for i in range(n):
-            if sum(ds) <= target_cs: break
-            if ds[i] > 5: ds[i] -= 1
-    i = 0
-    while sum(ds) < target_cs:
-        ds[i % n] += 1
-        i += 1
-
-    # lead (başlangıcı öne çek)
-    try:
-        lead_ms = int(os.getenv("CAPTION_LEAD_MS", os.getenv("KARAOKE_LEAD_MS", "0")))
-    except Exception:
-        lead_ms = 0
-    lead_cs_target = max(0, int(round(lead_ms / 10.0)))
-
-    if lead_cs_target > 0 and sum(ds) > 5 * n:
-        removed = 0
-        for i in range(n):
-            if removed >= lead_cs_target: break
-            can_take = max(0, ds[i] - 5)
-            take = min(can_take, lead_cs_target - removed)
-            if take > 0:
-                ds[i] -= take
-                removed += take
-        if n >= 2:
-            add_a = removed // 2
-            add_b = removed - add_a
-            ds[-2] += add_a
-            ds[-1] += add_b
-        else:
-            ds[-1] += removed
-
-    cap = " ".join([w for w, _ in words_upper])
-    _ = wrap_mobile_lines(cap, max_line_length=CAPTION_MAX_LINE, max_lines=3).replace("\n", "\\N")
-    kline = "".join([f"{{\\k{ds[i]}}}{words_upper[i][0]} " for i in range(n)]).strip()
-
-    ass = f"""[Script Info]
-ScriptType: v4.00+
-PlayResX: {VIDEO_W}
-PlayResY: {VIDEO_H}
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Base,{fontname},{fontsize},{_to_ass(KARAOKE_INACTIVE)},{_to_ass(KARAOKE_ACTIVE)},{_to_ass(KARAOKE_OUTLINE)},&H7F000000,1,0,0,0,100,100,0,0,1,{outline},0,2,50,50,{margin_v},0
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-Dialogue: 0,0:00:00.00,{_ass_time(seg_dur)},Base,,0,0,{margin_v},,{{\\bord{outline}\\shad0}}{kline}
-"""
-    return ass
-
-def draw_capcut_text(seg: str, text: str, color: str, font: str, outp: str, is_hook: bool=False, words: Optional[List[Tuple[str,float]]]=None):
-    """KARAOKE öncelikli. subtitles yoksa drawtext; ikisi de yoksa opsiyonel fail."""
-    seg_dur = ffprobe_dur(seg)
-    frames = max(2, int(round(seg_dur * TARGET_FPS)))
-
-    if KARAOKE_CAPTIONS and _HAS_SUBTITLES:
-        # karaoke (ALL CAPS + kelime highlight)
-        words = words or []
-        ass_txt = _build_karaoke_ass(text, seg_dur, words, is_hook)
-        ass_path = str(pathlib.Path(seg).with_suffix(".ass"))
-        pathlib.Path(ass_path).write_text(ass_txt, encoding="utf-8")
-        tmp_out = str(pathlib.Path(outp).with_suffix(".tmp.mp4"))
-        ass_ff = _ff_sanitize_path(ass_path)  # FIX: güvenli path
-        try:
-            run([
-                "ffmpeg","-y","-hide_banner","-loglevel","error",
-                "-i", seg, "-vf", f"subtitles='{ass_ff}'",
-                "-r", str(TARGET_FPS), "-vsync","cfr",
-                "-an","-c:v","libx264","-preset","medium","-crf",str(max(16,CRF_VISUAL-3)),
-                "-pix_fmt","yuv420p","-movflags","+faststart", tmp_out
-            ])
-            enforce_video_exact_frames(tmp_out, frames, outp)
-            return
-        except Exception as e:
-            print(f"⚠️ subtitles overlay failed, falling back to drawtext: {e}")  # FIX: fallback
-        finally:
-            pathlib.Path(ass_path).unlink(missing_ok=True)
-            pathlib.Path(tmp_out).unlink(missing_ok=True)
-
-    # ---- drawtext fallback (ALL CAPS)
-    if _HAS_DRAWTEXT:
-        wrapped = wrap_mobile_lines(clean_caption_text(text).upper(), CAPTION_MAX_LINE, CAPTION_MAX_LINES)
-        tf = str(pathlib.Path(seg).with_suffix(".caption.txt"))
-        pathlib.Path(tf).write_text(wrapped, encoding="utf-8")
-
-        lines = wrapped.split("\n")
-        n_lines = max(1, len(lines))
-        maxchars = max((len(l) for l in lines), default=1)
-
-        base = 60 if is_hook else 50
-        ratio = CAPTION_MAX_LINE / max(1, maxchars)
-        fs = int(base * min(1.0, max(0.50, ratio)))
-        if n_lines >= 5: fs = int(fs * 0.92)
-        if n_lines >= 6: fs = int(fs * 0.88)
-        if n_lines >= 7: fs = int(fs * 0.84)
-        if n_lines >= 8: fs = int(fs * 0.80)
-        fs = max(22, fs)
-
-        if VIDEO_W > VIDEO_H:
-            # landscape placement
-            if n_lines >= 6:   y_pos = "(h*0.70 - text_h/2)"
-            elif n_lines >= 4: y_pos = "(h*0.74 - text_h/2)"
-            else:              y_pos = "(h*0.78 - text_h/2)"
-        else:
-            if n_lines >= 6:   y_pos = "(h*0.55 - text_h/2)"
-            elif n_lines >= 4: y_pos = "(h*0.58 - text_h/2)"
-            else:              y_pos = "h-h/3-text_h/2"
-
-        font_arg = f":fontfile={_ff_sanitize_font(font)}" if font else ""
-        col = _ff_color(color)
-        tf_ff = _ff_sanitize_path(tf)  # FIX: drawtext textfile path kaçışı
-        common = f"textfile='{tf_ff}':fontsize={fs}:x=(w-text_w)/2:y={y_pos}:line_spacing=10"
-
-        shadow = f"drawtext={common}{font_arg}:fontcolor=black@0.85:borderw=0"
-        box    = f"drawtext={common}{font_arg}:fontcolor=white@0.0:box=1:boxborderw={(22 if is_hook else 18)}:boxcolor=black@0.65"
-        main   = f"drawtext={common}{font_arg}:fontcolor={col}:borderw={(5 if is_hook else 4)}:bordercolor=black@0.9"
-
-        vf_overlay = f"{shadow},{box},{main}"
-        vf = f"{vf_overlay},fps={TARGET_FPS},setpts=N/{TARGET_FPS}/TB,trim=start_frame=0:end_frame={frames}"
-        tmp_out = str(pathlib.Path(outp).with_suffix(".tmp.mp4"))
-        try:
-            run([
-                "ffmpeg","-y","-hide_banner","-loglevel","error",
-                "-i", seg, "-vf", vf,
-                "-r", str(TARGET_FPS), "-vsync","cfr",
-                "-an",
-                "-c:v","libx264","-preset","medium","-crf",str(max(16,CRF_VISUAL-3)),
-                "-pix_fmt","yuv420p","-movflags","+faststart", tmp_out
-            ])
-            enforce_video_exact_frames(tmp_out, frames, outp)
-        finally:
-            pathlib.Path(tf).unlink(missing_ok=True)
-            pathlib.Path(tmp_out).unlink(missing_ok=True)
-        return
-
-    if REQUIRE_CAPTIONS:
-        raise RuntimeError("Captions required but neither 'drawtext' nor 'subtitles' filter is available in ffmpeg.")
-    print("⚠️ FFmpeg 'drawtext' ve 'subtitles' filtreleri yok — caption atlanıyor.")
-    enforce_video_exact_frames(seg, frames, outp)
 
 def pad_video_to_duration(video_in: str, target_sec: float, outp: str):
     vdur = ffprobe_dur(video_in)
@@ -1045,7 +841,7 @@ def overlay_cta_tail(video_in: str, text: str, outp: str, show_sec: float, font:
     pathlib.Path(tf).write_text(wrapped, encoding="utf-8")
     font_arg = f":fontfile={_ff_sanitize_font(font)}" if font else ""
     y_frac = 0.16 if VIDEO_W > VIDEO_H else 0.18
-    tf_ff = _ff_sanitize_path(tf)  # FIX: CTA textfile path kaçışı
+    tf_ff = _ff_sanitize_path(tf)
     common = f"textfile='{tf_ff}':fontsize=52:x=(w-text_w)/2:y=h*{y_frac}:line_spacing=10"
     box    = f"drawtext={common}{font_arg}:fontcolor=white@0.0:box=1:boxborderw=18:boxcolor=black@0.55:enable='gte(t,{t0:.3f})'"
     main   = f"drawtext={common}{font_arg}:fontcolor={_ff_color('#3EA6FF')}:borderw=5:bordercolor=black@0.9:enable='gte(t,{t0:.3f})'"
@@ -1058,6 +854,56 @@ def overlay_cta_tail(video_in: str, text: str, outp: str, show_sec: float, font:
         "-pix_fmt","yuv420p","-movflags","+faststart", outp
     ])
     pathlib.Path(tf).unlink(missing_ok=True)
+
+def overlay_cta_mid(video_in: str, text: str, outp: str, show_sec: float, font: str, frac: float = 0.65):
+    """Videonun ortasında kısa yorum CTA'sı."""
+    vdur = ffprobe_dur(video_in)
+    if vdur <= 0.1 or not text.strip() or show_sec <= 0:
+        pathlib.Path(outp).write_bytes(pathlib.Path(video_in).read_bytes())
+        return
+    t0 = max(0.0, min(vdur - show_sec - 0.2, max(1.5, vdur * max(0.15, min(0.9, frac)))))
+    t1 = min(vdur, t0 + show_sec)
+    tf = str(pathlib.Path(outp).with_suffix(".midcta.txt"))
+    wrapped = wrap_mobile_lines(text.upper(), max_line_length=28, max_lines=2)
+    pathlib.Path(tf).write_text(wrapped, encoding="utf-8")
+    font_arg = f":fontfile={_ff_sanitize_font(font)}" if font else ""
+    y_frac = 0.15 if VIDEO_W > VIDEO_H else 0.17
+    tf_ff = _ff_sanitize_path(tf)
+    common = f"textfile='{tf_ff}':fontsize=48:x=(w-text_w)/2:y=h*{y_frac}:line_spacing=8"
+    box    = f"drawtext={common}{font_arg}:fontcolor=white@0.0:box=1:boxborderw=16:boxcolor=black@0.5:enable='between(t,{t0:.3f},{t1:.3f})'"
+    main   = f"drawtext={common}{font_arg}:fontcolor={_ff_color('#3EA6FF')}:borderw=4:bordercolor=black@0.9:enable='between(t,{t0:.3f},{t1:.3f})'"
+    vf     = f"{box},{main},fps={TARGET_FPS},setpts=N/{TARGET_FPS}/TB"
+    run([
+        "ffmpeg","-y","-hide_banner","-loglevel","error",
+        "-i", video_in, "-vf", vf,
+        "-r", str(TARGET_FPS), "-vsync","cfr",
+        "-an","-c:v","libx264","-preset","medium","-crf",str(CRF_VISUAL),
+        "-pix_fmt","yuv420p","-movflags","+faststart", outp
+    ])
+    pathlib.Path(tf).unlink(missing_ok=True)
+
+def apply_end_screen_pad(video_in: str, pad_sec: float, outp: str):
+    """Son pad_sec boyunca blur + hafif desat ile sakin blok; sadece videoyu işler."""
+    vdur = ffprobe_dur(video_in)
+    if pad_sec <= 0.1 or vdur <= pad_sec + 0.1:
+        pathlib.Path(outp).write_bytes(pathlib.Path(video_in).read_bytes())
+        return
+    split_t = max(0.0, vdur - pad_sec)
+    fc = (
+        f"[0:v]split[v0][v1];"
+        f"[v0]trim=start=0:end={split_t:.3f},setpts=PTS-STARTPTS[pre];"
+        f"[v1]trim=start={split_t:.3f},setpts=PTS-STARTPTS,"
+        f"boxblur=8:1,eq=saturation=0.85[tail];"
+        f"[pre][tail]concat=n=2:v=1:a=0[v]"
+    )
+    run([
+        "ffmpeg","-y","-hide_banner","-loglevel","error",
+        "-i", video_in,
+        "-filter_complex", fc, "-map","[v]",
+        "-r", str(TARGET_FPS), "-vsync","cfr",
+        "-an","-c:v","libx264","-preset","medium","-crf",str(CRF_VISUAL),
+        "-pix_fmt","yuv420p","-movflags","+faststart", outp
+    ])
 
 # ==================== Audio concat (lossless) ====================
 def concat_audios(files: List[str], outp: str):
@@ -1304,7 +1150,6 @@ def build_per_scene_queries(sentences: List[str], fallback_terms: List[str], top
     queries=[]
     fb_idx = 0
 
-    # Aydınlatma odaklı küçük sözlük → daha hedefli sonuçlar
     lex = [
         ("window", "window light"),
         ("curtain", "sheer curtains"),
@@ -1324,7 +1169,6 @@ def build_per_scene_queries(sentences: List[str], fallback_terms: List[str], top
         s_low = " " + (s or "").lower() + " "
         picked=None
 
-        # Önce özel lexicon
         for key, val in lex:
             if key in s_low:
                 picked = val; break
@@ -1573,27 +1417,57 @@ def upload_youtube(video_path: str, meta: dict) -> str:
     except HttpError as e:
         raise RuntimeError(f"YouTube upload error: {e}")
 
-# ==================== Long SEO Description ====================
-def build_long_description(channel: str, topic: str, sentences: List[str], tags: List[str]) -> Tuple[str, str, List[str]]:
+# ==================== Long SEO Description + Chapters ====================
+def _sec_to_hhmmss(s: float) -> str:
+    s = int(round(max(0, s)))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return (f"{h:02d}:{m:02d}:{sec:02d}" if h>0 else f"{m:02d}:{sec:02d}")
+
+def _short_label(text: str, words: int = 6) -> str:
+    t = clean_caption_text(text)
+    t = re.sub(r"[\.\!\?]+$", "", t)
+    toks = t.split()
+    if not toks: return "Scene"
+    return " ".join(toks[:words])
+
+def build_chapters(sentences: List[str], durations: List[float]) -> List[str]:
+    lines=[]
+    t=0.0
+    for i,(s,d) in enumerate(zip(sentences, durations)):
+        label = _short_label(s, words=6)
+        lines.append(f"{_sec_to_hhmmss(t)} {label}")
+        t += max(0.5, float(d))
+    # Ensure last chapter exists at 00:00
+    if lines and not lines[0].startswith("00:00"):
+        lines[0] = "00:00 " + lines[0].split(" ",1)[1]
+    return lines
+
+def build_long_description(channel: str, topic: str, sentences: List[str], tags: List[str], chapters: Optional[List[str]] = None) -> Tuple[str, str, List[str]]:
     hook = (sentences[0].rstrip(" .!?") if sentences else topic or channel)
     title = (hook[:1].upper() + hook[1:])[:95]
     para = " ".join(sentences)
     explainer = (
         f"{para} "
-        f"This short explores “{topic}” with clear, visual steps so you can grasp it at a glance. "
+        f"This video explores “{topic}” with clear, visual steps. "
         f"Rewatch to catch tiny details, save for later, and share with someone who’ll enjoy it."
     )
     tagset = []
     base_terms = [w for w in re.findall(r"[A-Za-z]{3,}", (topic or ""))][:5]
     for t in base_terms: tagset.append("#" + t.lower())
-    tagset += ["#shorts", "#learn", "#visual", "#broll", "#education"]
+    tagset += (["#learn", "#visual", "#education"] if LONGFORM else ["#shorts", "#learn", "#visual", "#broll", "#education"])
     if tags:
         for t in tags[:10]:
             tclean = re.sub(r"[^A-Za-z0-9]+","", t).lower()
             if tclean and ("#"+tclean) not in tagset: tagset.append("#"+tclean)
     body = (
         f"{explainer}\n\n— Key takeaways —\n"
-        + "\n".join([f"• {s}" for s in sentences[:8]]) +
+        + "\n".join([f"• {s}" for s in sentences[: min(8, len(sentences)) ]])
+    )
+    if chapters:
+        body += "\n\n— Chapters —\n" + "\n".join(chapters[:30])
+    body += (
         "\n\n— Why it matters —\nThis topic sticks because it ties a vivid visual to a single idea per scene. "
         f"That’s how your brain remembers faster and better.\n\n— Watch next —\n"
         f"Subscribe for more {topic.lower()} in clear, repeatable visuals.\n\n"
@@ -1670,43 +1544,8 @@ def _make_bgm_looped(src: str, dur: float, out_wav: str):
         "-af", f"loudnorm=I=-21:TP=-2.0:LRA=11,"
                f"afade=t=in:st=0:d={fade:.2f},afade=t=out:st={endst:.2f}:d={fade:.2f},"
                "aresample=48000,pan=mono|c0=0.5*FL+0.5*FR",
-
         "-ar","48000","-ac","1","-c:a","pcm_s16le",
         out_wav
-    ])
-
-# --- BGM helpers (ekleyin / değiştirin) ---
-
-def _find_bgm_candidates() -> List[str]:
-    """repo kökünde bgm/ klasöründen veya BGM_URLS (virgül/boşlukla ayrılmış http linkleri) listesinden adayları döndürür."""
-    out = []
-    try:
-        d = pathlib.Path("bgm")
-        if d.exists():
-            for pat in ("*.mp3","*.wav","*.m4a","*.flac","*.ogg"):
-                out += [str(p) for p in d.glob(pat)]
-    except Exception:
-        pass
-
-    urls = (os.getenv("BGM_URLS") or "").strip()
-    if urls:
-        for u in re.split(r"[,\s]+", urls):
-            u = u.strip()
-            if u.startswith("http"):
-                out.append(u)
-    return out
-
-def _loop_to_duration(bgm_in: str, target_sec: float, outp: str):
-    """
-    BGM'i tam süreye uzatır (gerekirse loop). Yerel dosya bekler; URL verdiysek önce indirildiğini varsayıyoruz.
-    """
-    run([
-        "ffmpeg","-y","-hide_banner","-loglevel","error",
-        "-stream_loop","-1","-t",f"{max(0.1,target_sec):.3f}",
-        "-i", bgm_in,
-        "-ar","48000","-ac","1",
-        "-af","dynaudnorm=f=250:g=4",
-        outp
     ])
 
 def _duck_and_mix(voice_in: str, bgm_in: str, outp: str):
@@ -1716,14 +1555,12 @@ def _duck_and_mix(voice_in: str, bgm_in: str, outp: str):
       2) BGM'i, seslendirmeyi sidechain olarak kullanarak bastırırız (duck).
       3) Sonra VOICE + DUCKED_BGM'i karıştırırız.
     """
-    bgm_gain_db   = float(os.getenv("BGM_GAIN_DB", "-10"))     # daha yüksek için -8 / -6 deneyebilirsiniz
+    bgm_gain_db   = float(os.getenv("BGM_GAIN_DB", "-10"))
     thr           = float(os.getenv("BGM_DUCK_THRESH", "0.03"))
     ratio         = float(os.getenv("BGM_DUCK_RATIO",  "10"))
     attack_ms     = int(os.getenv("BGM_DUCK_ATTACK_MS","6"))
     release_ms    = int(os.getenv("BGM_DUCK_RELEASE_MS","180"))
 
-    # ÖNEMLİ: sidechaincompress SIRASI [PROGRAM][SIDECHAIN] → [BGM][VOICE]
-    # Ayrıca makeup en az 1 olmalı (0 hatası alıyordunuz).
     sc = (
         f"sidechaincompress="
         f"threshold={thr}:ratio={ratio}:attack={attack_ms}:release={release_ms}:"
@@ -1737,7 +1574,6 @@ def _duck_and_mix(voice_in: str, bgm_in: str, outp: str):
             f"[0:a][duck]amix=inputs=2:duration=shortest,aresample=48000,alimiter=limit=0.98[mix]"
         )
     else:
-        # FIX: sidechain yoksa basit amix fallback
         filter_complex = (
             f"[1:a]volume={bgm_gain_db}dB[b];"
             f"[0:a][b]amix=inputs=2:duration=shortest,aresample=48000,alimiter=limit=0.98[mix]"
@@ -1753,11 +1589,70 @@ def _duck_and_mix(voice_in: str, bgm_in: str, outp: str):
         outp
     ])
 
+# ==================== Shot planning (5s cadence) ====================
+def build_shot_plan(total_sec: float, base_len: float = SHOT_LEN_SEC, jitter: float = SHOT_JITTER_SEC) -> List[float]:
+    """Return list of shot durations that sum to ~total_sec with small jitter."""
+    rng = random.Random(ROTATION_SEED or int(time.time()))
+    out=[]
+    t=0.0
+    while t + base_len*0.6 < total_sec:
+        j = rng.uniform(-jitter, jitter)
+        dur = max(2.8, base_len + j)
+        if t + dur > total_sec:
+            break
+        out.append(dur); t += dur
+    out.append(max(1.0, total_sec - t))
+    return out
+
+def choose_clip_sequence(available: Dict[int,str], shot_count: int, max_uses: int = PEXELS_MAX_USES_PER_CLIP,
+                         no_consec: bool = REUSE_NO_CONSECUTIVE) -> Tuple[List[str], List[int]]:
+    """Pick files for each shot respecting reuse rules."""
+    ids = list(available.keys())
+    usage = {vid:0 for vid in ids}
+    last_id = None
+    chosen_files=[]; chosen_ids=[]
+    for _ in range(shot_count):
+        # sort by usage asc
+        cands = sorted(ids, key=lambda k: usage[k])
+        picked = None
+        for vid in cands:
+            if usage[vid] >= max_uses: 
+                continue
+            if no_consec and last_id is not None and vid == last_id:
+                continue
+            picked = vid
+            break
+        if picked is None:
+            # relax no_consec if needed
+            for vid in cands:
+                if usage[vid] < max_uses:
+                    picked = vid; break
+        if picked is None:
+            picked = min(ids, key=lambda k: usage[k])  # force pick least used
+        usage[picked] += 1
+        last_id = picked
+        chosen_files.append(available[picked])
+        chosen_ids.append(picked)
+        _USED_PEXELS_IDS_RUNTIME.add(picked)
+    return chosen_files, chosen_ids
+
+# ==================== Debug meta ====================
+def _dump_debug_meta(path: str, obj: dict):
+    try:
+        pathlib.Path(path).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
 # ==================== Main ====================
 def main():
+    global STATE_FILE, GLOBAL_TOPIC_STATE, LEGACY_STATE_FILE, LEGACY_GLOBAL_STATE
+    STATE_FILE = f"state_{re.sub(r'[^A-Za-z0-9]+','_',CHANNEL_NAME)}.json"
+    GLOBAL_TOPIC_STATE = "state_global_topics.json"
+    LEGACY_STATE_FILE = f"state_{CHANNEL_NAME}.json"
+    LEGACY_GLOBAL_STATE = "state_global.json"
+
     print(f"==> {CHANNEL_NAME} | MODE={MODE} | topic-first build")
-    # Captions tamamen kapatılabildiği için, filtre yoksa sadece captions AÇIKSA uyar/engelle
-    if CAPTIONS_ENABLE and not (_HAS_DRAWTEXT or _HAS_SUBTITLES):
+    if CAPTIONS_ENABLED and not (_HAS_DRAWTEXT or _HAS_SUBTITLES):
         msg = "⚠️ UYARI: ffmpeg'te ne 'drawtext' ne 'subtitles' var. Altyazılar üretilemez."
         if REQUIRE_CAPTIONS: raise RuntimeError(msg + " REQUIRE_CAPTIONS=1 olduğu için durduruldu.")
         else: print(msg + " (devam edilecek)")
@@ -1818,7 +1713,7 @@ def main():
                 continue
 
         score = _content_score(sents)
-        print(f"📝 Content: {tpc} | {len(sents)} lines | score={score:.2f}")
+        print(f"📝 Content: {tpc} | {len(sents)} scenes | score={score:.2f}")
         if score > best_score:
             best = (tpc, sents, search_terms, ttl, desc, tags)
             best_score = score
@@ -1848,7 +1743,7 @@ def main():
         "lang": LANG, "model": GEMINI_MODEL, "ts": time.time()
     })
 
-    print(f"📊 Sentences: {len(sentences)}")
+    print(f"📊 Scenes: {len(sentences)}")
 
     # 2) TTS (kelime zamanları ile)
     tmp = tempfile.mkdtemp(prefix="enhanced_shorts_")
@@ -1862,23 +1757,23 @@ def main():
         wavs.append(w); metas.append((base, d, words))
         print(f"   {i+1}/{len(sentences)}: {d:.2f}s")
 
-    # Toplam anlatım süresi ve 5 sn'lik görüntü chunk sayısı
-    total_narr = sum(d for _, d, _ in metas)
-    n_chunks = max(1, int(math.ceil(total_narr / max(0.5, VISUAL_CHUNK_SEC))))
-    print(f"🎚️ Narration total = {total_narr:.2f}s | visual chunks = {n_chunks} × {VISUAL_CHUNK_SEC:.2f}s")
+    # Total audio duration
+    scene_durations = [m[1] for m in metas]
+    total_audio = sum(scene_durations)
+    print(f"🔊 Total narration: {total_audio:.2f}s")
 
     # 3) Pexels — per-video terms
     per_scene_queries = build_per_scene_queries([m[0] for m in metas], (search_terms or user_terms or []), topic=tpc)
     print("🔎 Per-scene queries:")
     for q in per_scene_queries: print(f"   • {q}")
 
-    # For longform, default to 8–10 scenes (legacy), ancak chunk montaj için
-    # en az ceil(n_chunks / MAX_REUSE_PER_VIDEO) adet benzersiz klip gerekli.
-    default_scenes = "9" if LONGFORM else "8"
-    need_clips_legacy = max(6, min(12, int(os.getenv("SCENE_COUNT", default_scenes))))
-    min_unique_needed = max(2, math.ceil(n_chunks / max(1, MAX_REUSE_PER_VIDEO)))
-    need_clips = max(need_clips_legacy, min_unique_needed)
+    # Shot plan for whole video (5s cadence)
+    shot_durs = build_shot_plan(total_audio, SHOT_LEN_SEC, SHOT_JITTER_SEC)
+    shot_count = len(shot_durs)
+    print(f"🎯 Shot cadence: {shot_count} shots (~{SHOT_LEN_SEC:.1f}s each)")
 
+    # Build pool sized for shots
+    need_clips = max(10, min(80, shot_count))
     pool: List[Tuple[int,str]] = build_pexels_pool(
         topic=tpc,
         sentences=[m[0] for m in metas],
@@ -1888,7 +1783,7 @@ def main():
     )
     if not pool: raise RuntimeError("Pexels: no suitable clips (after all fallbacks).")
 
-    # 4) İndir ve havuzu oluştur
+    # 4) İndir
     downloads: Dict[int,str] = {}
     print("⬇️ Download pool…")
     for idx, (vid, link) in enumerate(pool):
@@ -1896,8 +1791,8 @@ def main():
             f = str(pathlib.Path(tmp) / f"pool_{idx:02d}_{vid}.mp4")
             with requests.get(link, stream=True, timeout=120) as rr:
                 rr.raise_for_status()
-                with open(f, "wb") as w:
-                    for ch in rr.iter_content(8192): w.write(ch)
+                with open(f, "wb") as wfd:
+                    for ch in rr.iter_content(8192): wfd.write(ch)
             if pathlib.Path(f).stat().st_size > 300_000:
                 downloads[vid] = f
         except Exception as e:
@@ -1905,98 +1800,28 @@ def main():
     if not downloads: raise RuntimeError("Pexels pool empty after downloads.")
     print(f"   Downloaded unique clips: {len(downloads)}")
 
-    # Chunk montaj için toplam kapasite = benzersiz_klip_sayısı * MAX_REUSE_PER_VIDEO
-    capacity = len(downloads) * MAX_REUSE_PER_VIDEO
-    if capacity < n_chunks:
-        print(f"   Capacity short ({capacity} < {n_chunks}), trying to backfill more clips…")
-        locale = "tr-TR" if LANG.startswith("tr") else "en-US"
-        page = 1
-        tried = set(downloads.keys())
-        while capacity < n_chunks and page <= 4:
-            pops = _pexels_popular(locale, page=page, per_page=50)
-            page += 1
-            for vid, link, w,h,dur in pops:
-                if vid in tried: continue
-                try:
-                    f = str(pathlib.Path(tmp) / f"capfill_{vid}.mp4")
-                    with requests.get(link, stream=True, timeout=120) as rr:
-                        rr.raise_for_status()
-                        with open(f, "wb") as wfd:
-                            for ch in rr.iter_content(8192): wfd.write(ch)
-                    if pathlib.Path(f).stat().st_size > 300_000:
-                        downloads[vid] = f
-                        tried.add(vid)
-                        capacity = len(downloads) * MAX_REUSE_PER_VIDEO
-                        if capacity >= n_chunks:
-                            break
-                except Exception:
-                    continue
-        if capacity < n_chunks:
-            # Pixabay son çare
-            need_more = math.ceil((n_chunks - capacity) / max(1, MAX_REUSE_PER_VIDEO))
-            pix = _pixabay_fallback("b-roll", need_more, locale)
-            for vid, link in pix:
-                try:
-                    f = str(pathlib.Path(tmp) / f"capfill_pix_{vid}.mp4")
-                    with requests.get(link, stream=True, timeout=120) as rr:
-                        rr.raise_for_status()
-                        with open(f, "wb") as wfd:
-                            for ch in rr.iter_content(8192): wfd.write(ch)
-                    if pathlib.Path(f).stat().st_size > 300_000:
-                        downloads[vid] = f
-                        capacity = len(downloads) * MAX_REUSE_PER_VIDEO
-                        if capacity >= n_chunks:
-                            break
-                except Exception:
-                    pass
-        print(f"   Capacity after backfill: {capacity} (needed {n_chunks})")
+    # 5) Shot → clip mapping (allow reuse up to 3, not consecutive)
+    chosen_files, chosen_ids = choose_clip_sequence(downloads, shot_count,
+                                                   max_uses=PEXELS_MAX_USES_PER_CLIP,
+                                                   no_consec=REUSE_NO_CONSECUTIVE)
 
-    # 5) Chunk bazlı görüntü montajı (altyazı yok)
-    print("🎬 Visual montage (fixed chunks, no captions)…")
-    vid_ids = list(downloads.keys())
-    random.shuffle(vid_ids)
-    usage = {vid: 0 for vid in vid_ids}
-    last_vid = None
-    segs = []
-    used_ids_order: List[int] = []
+    # 6) Build visual segments (no captions; each ~5s)
+    print("🎬 Building b-roll segments…")
+    segs=[]
+    for i, (src, dur) in enumerate(zip(chosen_files, shot_durs)):
+        seg_out = str(pathlib.Path(tmp) / f"shot_{i:03d}.mp4")
+        make_segment(src, dur, seg_out)
+        segs.append(seg_out)
 
-    def _pick_next_vid():
-        # Önce: last_vid olmayan ve kullanım < MAX olanlar
-        cands = [v for v in vid_ids if usage[v] < MAX_REUSE_PER_VIDEO and v != last_vid]
-        if not cands:
-            # Zorunlu durumda (çok az klip): last_vid hariç kapasite yoksa, last_vid'i da al.
-            cands = [v for v in vid_ids if usage[v] < MAX_REUSE_PER_VIDEO]
-        if not cands:
-            return None
-        # En az kullanılanı tercih et, eşitlikte rastgele
-        minuse = min(usage[v] for v in cands)
-        cands2 = [v for v in cands if usage[v] == minuse]
-        return random.choice(cands2)
+    # 7) Assemble visual reel
+    print("🎞️ Assemble video…")
+    vcat = str(pathlib.Path(tmp) / "video_concat.mp4"); concat_videos_filter(segs, vcat)
 
-    for i in range(n_chunks):
-        pick = _pick_next_vid()
-        if pick is None:
-            print(f"⚠️ Not enough clip capacity to fill all chunks ({i}/{n_chunks}).")
-            break
-        src = downloads[pick]
-        out_seg = str(pathlib.Path(tmp) / f"chunk_{i:03d}.mp4")
-        make_segment(src, float(VISUAL_CHUNK_SEC), out_seg)
-        segs.append(out_seg)
-        used_ids_order.append(pick)
-        usage[pick] += 1
-        last_vid = pick
+    # 8) Audio concat
+    print("🔊 Assemble audio…")
+    acat = str(pathlib.Path(tmp) / "audio_concat.wav"); concat_audios(wavs, acat)
 
-    if len(segs) < 1:
-        raise RuntimeError("No visual chunks were created.")
-
-    # 6) Birleştir (video önce, ses sonra)
-    print("🎞️ Assemble…")
-    vcat = str(pathlib.Path(tmp) / "video_concat.mp4")
-    concat_videos_filter(segs, vcat)
-    acat = str(pathlib.Path(tmp) / "audio_concat.wav")
-    concat_audios(wavs, acat)
-
-    # 7) Süre & kare kilitleme
+    # 9) Lock durations (match to audio)
     adur = ffprobe_dur(acat); vdur = ffprobe_dur(vcat)
     if vdur + 0.02 < adur:
         vcat_padded = str(pathlib.Path(tmp) / "video_padded.mp4")
@@ -2007,23 +1832,44 @@ def main():
     vdur2 = ffprobe_dur(vcat); adur2 = ffprobe_dur(acat)
     print(f"🔒 Locked A/V: video={vdur2:.3f}s | audio={adur2:.3f}s | fps={TARGET_FPS}")
 
-    # 7.1) Contextual CTA (overlay only at tail)
+    # 9.1) Endscreen pad (visual calm block)
+    if ENDSCREEN_PAD_SEC > 0.2:
+        try:
+            v_endpad = str(pathlib.Path(tmp) / "video_endpad.mp4")
+            apply_end_screen_pad(vcat, ENDSCREEN_PAD_SEC, v_endpad)
+            vcat_exact2 = str(pathlib.Path(tmp) / "video_endpad_exact.mp4")
+            enforce_video_exact_frames(v_endpad, a_frames, vcat_exact2)
+            vcat = vcat_exact2
+        except Exception as e:
+            print(f"⚠️ Endscreen pad skipped: {e}")
+
+    # 9.2) Mid-video CTA
+    if MID_CTA_ENABLE:
+        try:
+            mid_cta_text = build_contextual_cta(tpc, [m[0] for m in metas], LANG)
+            v_midcta = str(pathlib.Path(tmp) / "video_midcta.mp4")
+            overlay_cta_mid(vcat, mid_cta_text, v_midcta, MID_CTA_SHOW_SEC, font, frac=MID_CTA_FRAC)
+            vcat_exact3 = str(pathlib.Path(tmp) / "video_midcta_exact.mp4")
+            enforce_video_exact_frames(v_midcta, a_frames, vcat_exact3)
+            vcat = vcat_exact3
+        except Exception as e:
+            print(f"⚠️ Mid-CTA overlay skipped: {e}")
+
+    # 9.3) Tail CTA (comments)
     cta_text = ""
     try:
         if CTA_ENABLE:
             cta_text = build_contextual_cta(tpc, [m[0] for m in metas], LANG)
             if cta_text:
-                print(f"💬 CTA: {cta_text}")
+                print(f"💬 CTA (tail): {cta_text}")
                 vcat_cta = str(pathlib.Path(tmp) / "video_cta.mp4")
                 overlay_cta_tail(vcat, cta_text, vcat_cta, CTA_SHOW_SEC, font)
-                # aynı kare sayısını koru:
-                vcat_exact2 = str(pathlib.Path(tmp) / "video_exact_cta.mp4")
-                enforce_video_exact_frames(vcat_cta, a_frames, vcat_exact2)
-                vcat = vcat_exact2
+                vcat_exact4 = str(pathlib.Path(tmp) / "video_exact_cta.mp4")
+                enforce_video_exact_frames(vcat_cta, a_frames, vcat_exact4); vcat = vcat_exact4
     except Exception as e:
         print(f"⚠️ CTA overlay skipped: {e}")
 
-    # 7.5) BGM mix (opsiyonel)
+    # 9.4) BGM mix (opsiyonel)
     if BGM_ENABLE:
         bgm_src = _pick_bgm_source(tmp)
         if bgm_src:
@@ -2032,26 +1878,37 @@ def main():
             _make_bgm_looped(bgm_src, adur2, bgm_loop)
             a_mix = str(pathlib.Path(tmp) / "audio_with_bgm.wav")
             _duck_and_mix(acat, bgm_loop, a_mix)
-            # yeniden tam kare süreye kilitle
             a_mix_exact = str(pathlib.Path(tmp) / "audio_with_bgm_exact.wav")
             lock_audio_duration(a_mix, max(2, int(round(adur2 * TARGET_FPS))), a_mix_exact)
             acat = a_mix_exact
         else:
             print("🎧 BGM: kaynak bulunamadı (BGM_DIR veya BGM_URLS).")
 
-    # 8) Mux
+    # 10) Mux
     ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    safe_topic = re.sub(r'[^A-Za-z0-9]+', '_', tpc)[:60] or "Short"
+    safe_topic = re.sub(r'[^A-Za-z0-9]+', '_', tpc)[:60] or "Video"
     outp = f"{OUT_DIR}/{CHANNEL_NAME}_{safe_topic}_{ts}.mp4"
     print("🔄 Mux…"); mux(vcat, acat, outp)
     final = ffprobe_dur(outp); print(f"✅ Saved: {outp} ({final:.2f}s)")
 
-    # 9) Metadata (long SEO)
-    title, description, yt_tags = build_long_description(CHANNEL_NAME, tpc, [m[0] for m in metas], tags)
+    # 11) Thumbnails (simple candidates at 25/50/75%)
+    try:
+        if THUMBNAIL_CANDIDATES > 0:
+            for i, frac in enumerate([0.25, 0.5, 0.75][:THUMBNAIL_CANDIDATES], start=1):
+                t = max(0.0, min(final-0.1, final * frac))
+                thumb = f"{OUT_DIR}/{CHANNEL_NAME}_{safe_topic}_{ts}_thumb_{i}.png"
+                run(["ffmpeg","-y","-hide_banner","-loglevel","error","-ss", f"{t:.3f}", "-i", outp, "-frames:v","1", thumb])
+            print(f"🖼️ Thumbnails exported ({THUMBNAIL_CANDIDATES}).")
+    except Exception as e:
+        print(f"⚠️ Thumbnail export skipped: {e}")
+
+    # 12) Metadata (long SEO) + Chapters
+    chapters_lines = build_chapters([m[0] for m in metas], scene_durations)
+    title, description, yt_tags = build_long_description(CHANNEL_NAME, tpc, [m[0] for m in metas], tags, chapters=chapters_lines)
     meta = {"title": title,"description": description,"tags": yt_tags,"privacy": VISIBILITY,
             "defaultLanguage": LANG,"defaultAudioLanguage": LANG}
 
-    # 10) Upload (varsa env)
+    # 13) Upload (varsa env)
     try:
         if os.getenv("UPLOAD_TO_YT","1") == "1":
             print("📤 Uploading to YouTube…")
@@ -2062,22 +1919,15 @@ def main():
     except Exception as e:
         print(f"❌ Upload skipped: {e}")
 
-    # 11) Kullanılmış Pexels ID'leri state'e ekle
+    # 14) Kullanılmış Pexels ID'leri state'e ekle
     try:
-        _blocklist_add_pexels(list(set(used_ids_order)), days=30)
+        _blocklist_add_pexels(chosen_ids, days=30)
     except Exception as e:
         print(f"⚠️ Blocklist save warn: {e}")
 
-    # 12) Temizlik
+    # 15) Temizlik
     try: shutil.rmtree(tmp); print("🧹 Cleaned temp files")
     except: pass
-
-# ==================== Debug meta ====================
-def _dump_debug_meta(path: str, obj: dict):
-    try:
-        pathlib.Path(path).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
 
 if __name__ == "__main__":
     main()
